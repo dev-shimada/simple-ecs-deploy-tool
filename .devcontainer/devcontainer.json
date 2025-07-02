@@ -1,0 +1,23 @@
+{
+	"name": "simple-ecs-deploy-tool",
+	"build": {
+		"context": ".",
+		"dockerfile": "Dockerfile"
+	},
+	"workspaceFolder": "/workspace",
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"rust-lang.rust-analyzer",
+				"GitHub.copilot"
+			]
+		}
+	},
+	"mounts": [
+		"source=${localWorkspaceFolder},target=/workspace,type=bind",
+		"source=${env:HOME}/.config/gcloud/application_default_credentials.json,target=/root/.config/gcloud/application_default_credentials.json,type=bind,readOnly=true"
+	],
+	"forwardPorts": [],
+	"remoteUser": "root",
+	"postCreateCommand": "/bin/bash .devcontainer/post_created.sh"
+}
