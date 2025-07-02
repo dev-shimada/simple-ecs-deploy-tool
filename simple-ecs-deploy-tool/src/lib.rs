@@ -14,17 +14,60 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// ECSのデプロイ設定をチェックします
-    Check,
+    Check {
+        #[clap(long)]
+        cluster: String,
+        #[clap(long)]
+        service: String,
+        #[clap(long)]
+        task_definition: String,
+        #[clap(long)]
+        repository_name: String,
+    },
 }
 
 pub async fn run() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Check => {
-            println!("Checking settings...");
+        Commands::Check { cluster, service, task_definition, repository_name } => {
+            let client = AwsSdkClient::new().await;
+            check(&client, cluster, service, task_definition, repository_name, &mut std::io::stdout()).await.unwrap();
         }
     }
+}
+
+pub async fn check<T: AwsClient>(
+    client: &T, 
+    cluster: &str, 
+    service: &str, 
+    task_definition: &str, 
+    repository_name: &str, 
+    mut writer: impl std::io::Write
+) -> Result<(), ()> {
+    let image_digests = client.describe_images(repository_name).await?;
+    let latest_image_digest = image_digests.first().unwrap();
+
+    let task_definition_arn = client.describe_task_definition(task_definition).await?;
+    let service_task_definition = client.describe_services(cluster, service).await?;
+
+    if *latest_image_digest != service_task_definition {
+        writeln!(writer, "Image digest mismatch:").unwrap();
+        writeln!(writer, "  Latest: {}", latest_image_digest).unwrap();
+        writeln!(writer, "  Service: {}", service_task_definition).unwrap();
+    } else {
+        writeln!(writer, "Image digest is up to date.").unwrap();
+    }
+
+    if task_definition_arn != service_task_definition {
+        writeln!(writer, "Task definition mismatch:").unwrap();
+        writeln!(writer, "  Latest: {}", task_definition_arn).unwrap();
+        writeln!(writer, "  Service: {}", service_task_definition).unwrap();
+    } else {
+        writeln!(writer, "Task definition is up to date.").unwrap();
+    }
+
+    Ok(())
 }
 
 #[async_trait]
@@ -38,6 +81,7 @@ pub trait EcrClient {
 #[async_trait]
 pub trait EcsClient {
     async fn describe_task_definition(&self, task_definition: &str) -> Result<String, ()>;
+    async fn describe_services(&self, cluster: &str, service: &str) -> Result<String, ()>;
 }
 
 pub struct AwsSdkClient {
@@ -83,6 +127,18 @@ impl EcsClient for AwsSdkClient {
             Err(_) => Err(())
         }
     }
+
+    async fn describe_services(&self, cluster: &str, service: &str) -> Result<String, ()> {
+        let resp = self.ecs_client.describe_services().cluster(cluster).services(service).send().await;
+        match resp {
+            Ok(output) => {
+                let service = output.services.unwrap_or_default().into_iter().next().unwrap();
+                let task_definition = service.task_definition.unwrap();
+                Ok(task_definition)
+            },
+            Err(_) => Err(())
+        }
+    }
 }
 
 impl AwsClient for AwsSdkClient {}
@@ -109,6 +165,10 @@ mod tests {
     #[async_trait]
     impl EcsClient for MockAwsClient {
         async fn describe_task_definition(&self, _task_definition: &str) -> Result<String, ()> {
+            Ok("arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:2".to_string())
+        }
+
+        async fn describe_services(&self, _cluster: &str, _service: &str) -> Result<String, ()> {
             Ok("arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:1".to_string())
         }
     }
@@ -125,7 +185,22 @@ mod tests {
     #[tokio::test]
     async fn test_get_latest_task_definition() {
         let mock_aws_client = MockAwsClient;
-        let task_def = mock_aws_client.describe_task_definition("dummy-task-def").await.unwrap();
-        assert_eq!(task_def, "arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:1");
+        let task_def = mock_aws_client.describe_task_definition("dummy--def").await.unwrap();
+        assert_eq!(task_def, "arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:2");
+    }
+
+    #[tokio::test]
+    async fn check_subcommand_runs() {
+        let mock_aws_client = MockAwsClient;
+        let mut writer = Vec::new();
+        let result = check(&mock_aws_client, "dummy-cluster", "dummy-service", "dummy-task-def", "dummy-repo", &mut writer).await;
+        assert!(result.is_ok());
+        let output = String::from_utf8(writer).unwrap();
+        assert!(output.contains("Image digest mismatch:"));
+        assert!(output.contains("  Latest: sha256:dummy_digest1"));
+        assert!(output.contains("  Service: arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:1"));
+        assert!(output.contains("Task definition mismatch:"));
+        assert!(output.contains("  Latest: arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:2"));
+        assert!(output.contains("  Service: arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:1"));
     }
 }
