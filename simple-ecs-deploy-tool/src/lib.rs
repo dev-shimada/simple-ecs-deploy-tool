@@ -9,6 +9,8 @@ use aws_sdk_ecs::{Client as EcsSdkClient};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+    #[clap(long)]
+    profile: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -31,7 +33,7 @@ pub async fn run() {
 
     match &cli.command {
         Commands::Check { cluster, service, task_definition, repository_name } => {
-            let client = AwsSdkClient::new().await;
+            let client = AwsSdkClient::new(cli.profile.as_deref()).await;
             check(&client, cluster, service, task_definition, repository_name, &mut std::io::stdout()).await.unwrap();
         }
     }
@@ -90,9 +92,16 @@ pub struct AwsSdkClient {
 }
 
 impl AwsSdkClient {
-    pub async fn new() -> Self {
+    pub async fn new(profile: Option<&str>) -> Self {
         let region_provider = RegionProviderChain::default_provider().or_else("ap-northeast-1");
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(region_provider);
+        
+        if let Some(profile_name) = profile {
+            config_loader = config_loader.profile_name(profile_name);
+        }
+
+        let config = config_loader.load().await;
         let ecr_client = EcrSdkClient::new(&config);
         let ecs_client = EcsSdkClient::new(&config);
         Self { ecr_client, ecs_client }
