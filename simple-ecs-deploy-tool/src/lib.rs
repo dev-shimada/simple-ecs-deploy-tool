@@ -116,6 +116,7 @@ pub trait EcsClient {
     async fn describe_services(&self, cluster: &str, service: &str) -> Result<String, ()>;
     async fn get_task_definition_image(&self, task_definition_arn: &str) -> Result<Option<String>, ()>;
     async fn get_task_definition_family_from_arn(&self, task_definition_arn: &str) -> Result<String, ()>;
+    // async fn get_image_digest_from_task_id(&self, task: &str) -> Result<Option<String>, ()>;
 }
 
 pub struct AwsSdkClient {
@@ -204,6 +205,23 @@ impl EcsClient for AwsSdkClient {
         let family = task_definition_arn.split('/').nth(1).and_then(|s| s.split(':').next()).map(|s| s.to_string());
         Ok(family.unwrap_or_default())
     }
+
+    // async fn get_image_digest_from_task_id(&self, task: &str) -> Result<Option<String>, ()> {
+    //     let resp = self.ecs_client.describe_tasks().tasks(task).send().await;
+    //     match resp {
+    //         Ok(output) => {
+    //             let tasks = output.tasks;
+    //             if let Some(task) = tasks.unwrap().get(0) {
+    //                 if let some(container) = task.containers.unwrap().get(0) {
+    //                     let digest = container.
+    //                 }
+    //             } else {
+    //                 Ok(None)
+    //             }
+    //         },
+    //         Err(_) => Err(())
+    //     }
+    // }
 }
 
 impl AwsClient for AwsSdkClient {}
