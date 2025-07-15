@@ -67,7 +67,7 @@ pub async fn check<T: AwsClient>(
         },
     };
 
-    let image_digests = client.describe_images(&repository_name).await?;
+    let image_digests = client.describe_image_digests(&repository_name).await?;
     let latest_image_digest = match image_digests.first() {
         Some(digest) => digest,
         None => {
@@ -75,15 +75,42 @@ pub async fn check<T: AwsClient>(
             return Err(());
         }
     };
+    let image_tags = client.describe_image_tags(&repository_name).await?;
+    let latest_image_tags = match image_tags.first() {
+        Some(tags) => tags,
+        None => {
+            writeln!(writer, "No images found in ECR repository: {}", repository_name).unwrap();
+            return Err(());
+        }
+    };
+    let service_image_digest = client.get_image_digest_from_task_id(task_definition.unwrap_or(&service_task_definition_arn)).await?; 
+    let service_image_digest = match service_image_digest {
+        Some(digest) => digest,
+        None => {
+            writeln!(writer, "No image found in service task definition: {}", service_task_definition_arn).unwrap();
+            return Err(());
+        }
+    };
 
-    if latest_image_digest != &service_image_uri {
+    // Compare the latest image digest with the service image digest
+    if latest_image_digest != &service_image_digest {
         writeln!(writer, "Image digest mismatch:").unwrap();
         writeln!(writer, "  Latest ECR: {}", latest_image_digest).unwrap();
-        writeln!(writer, "  Service image: {}", service_image_uri).unwrap();
+        writeln!(writer, "  Service image: {}", service_image_digest).unwrap();
     } else {
         writeln!(writer, "Image digest is up to date.").unwrap();
     }
 
+    // Compare the latest image tag with the service image tag
+    if !image_tags.is_empty() && latest_image_tags != &service_image_digest {
+        writeln!(writer, "Image tag mismatch:").unwrap();
+        writeln!(writer, "  Latest ECR: {}", latest_image_tags).unwrap();
+        writeln!(writer, "  Service image: {}", service_image_digest).unwrap();
+    } else {
+        writeln!(writer, "Image tag is up to date.").unwrap();
+    }
+
+    // Check the task definition
     let task_definition = match task_definition {
         Some(def) => def.to_string(),
         None => client.get_task_definition_family_from_arn(&service_task_definition_arn).await?,
@@ -106,7 +133,8 @@ pub trait AwsClient: EcrClient + EcsClient {}
 
 #[async_trait]
 pub trait EcrClient {
-    async fn describe_images(&self, repository_name: &str) -> Result<Vec<String>, ()>;
+    async fn describe_image_digests(&self, repository_name: &str) -> Result<Vec<String>, ()>;
+    async fn describe_image_tags(&self, repository_name: &str) -> Result<Vec<String>, ()>;
     async fn get_repository_name_from_image(&self, image_uri: &str) -> Result<Option<String>, ()>;
 }
 
@@ -116,7 +144,7 @@ pub trait EcsClient {
     async fn describe_services(&self, cluster: &str, service: &str) -> Result<String, ()>;
     async fn get_task_definition_image(&self, task_definition_arn: &str) -> Result<Option<String>, ()>;
     async fn get_task_definition_family_from_arn(&self, task_definition_arn: &str) -> Result<String, ()>;
-    // async fn get_image_digest_from_task_id(&self, task: &str) -> Result<Option<String>, ()>;
+    async fn get_image_digest_from_task_id(&self, task: &str) -> Result<Option<String>, ()>;
 }
 
 pub struct AwsSdkClient {
@@ -143,7 +171,7 @@ impl AwsSdkClient {
 
 #[async_trait]
 impl EcrClient for AwsSdkClient {
-    async fn describe_images(&self, repository_name: &str) -> Result<Vec<String>, ()> {
+    async fn describe_image_digests(&self, repository_name: &str) -> Result<Vec<String>, ()> {
         let resp = self.ecr_client.describe_images().repository_name(repository_name).send().await;
         match resp {
             Ok(output) => {
@@ -151,6 +179,19 @@ impl EcrClient for AwsSdkClient {
                 image_details.sort_by(|a, b| b.image_pushed_at.cmp(&a.image_pushed_at));
                 let digests = image_details.iter().filter_map(|d| d.image_digest.as_ref().map(|s| s.to_string())).collect();
                 Ok(digests)
+            },
+            Err(_) => Err(())
+        }
+    }
+
+    async fn describe_image_tags(&self, repository_name: &str) -> Result<Vec<String>, ()> {
+        let resp = self.ecr_client.describe_images().repository_name(repository_name).send().await;
+        match resp {
+            Ok(output) => {
+                let mut image_details = output.image_details.unwrap_or_default();
+                image_details.sort_by(|a, b| b.image_pushed_at.cmp(&a.image_pushed_at));
+                let tags = image_details.iter().filter_map(|d| d.image_tags.as_ref().iter().map(|s| s.to_string())).collect();
+                Ok(tags)
             },
             Err(_) => Err(())
         }
@@ -206,22 +247,28 @@ impl EcsClient for AwsSdkClient {
         Ok(family.unwrap_or_default())
     }
 
-    // async fn get_image_digest_from_task_id(&self, task: &str) -> Result<Option<String>, ()> {
-    //     let resp = self.ecs_client.describe_tasks().tasks(task).send().await;
-    //     match resp {
-    //         Ok(output) => {
-    //             let tasks = output.tasks;
-    //             if let Some(task) = tasks.unwrap().get(0) {
-    //                 if let some(container) = task.containers.unwrap().get(0) {
-    //                     let digest = container.
-    //                 }
-    //             } else {
-    //                 Ok(None)
-    //             }
-    //         },
-    //         Err(_) => Err(())
-    //     }
-    // }
+    async fn get_image_digest_from_task_id(&self, task: &str) -> Result<Option<String>, ()> {
+        let resp = self.ecs_client.describe_tasks().tasks(task).send().await;
+        match resp {
+            Ok(output) => {
+                let tasks = output.tasks;
+                if let Some(task) = tasks.unwrap().get(0) {
+                    if let Some(container) = task.containers().get(0) {
+                        if let Some(digest) = &container.image_digest {
+                            return Ok(Some(digest.to_string()));
+                        } else {
+                            return Ok(None);
+                        }
+                    } else {
+                        return Ok(None);
+                    }
+                } else {
+                    Ok(None)
+                }
+            },
+            Err(_) => Err(())
+        }
+    }
 }
 
 impl AwsClient for AwsSdkClient {}
@@ -234,13 +281,22 @@ mod tests {
 
     #[async_trait]
     impl EcrClient for MockAwsClient {
-        async fn describe_images(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+        async fn describe_image_digests(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
             Ok(vec![
                 "sha256:dummy_digest1".to_string(),
                 "sha256:dummy_digest2".to_string(),
                 "sha256:dummy_digest3".to_string(),
                 "sha256:dummy_digest4".to_string(),
                 "sha256:dummy_digest5".to_string(),
+            ])
+        }
+        async fn describe_image_tags(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+            Ok(vec![
+                "image_tag1".to_string(),
+                "image_tag2".to_string(),
+                "image_tag3".to_string(),
+                "image_tag4".to_string(),
+                "image_tag5".to_string(),
             ])
         }
 
@@ -270,6 +326,9 @@ mod tests {
         async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> Result<String, ()> {
             Ok("dummy-task-def".to_string())
         }
+        async fn get_image_digest_from_task_id(&self, _task: &str) -> Result<Option<String>, ()> {
+            Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest_from_service".to_string()))
+        }
     }
 
     impl AwsClient for MockAwsClient {}
@@ -277,7 +336,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_latest_images_from_ecr() {
         let mock_aws_client = MockAwsClient;
-        let images = mock_aws_client.describe_images("dummy-repo").await.unwrap();
+        let images = mock_aws_client.describe_image_digests("dummy-repo").await.unwrap();
         assert_eq!(images.len(), 5);
     }
 
@@ -309,8 +368,11 @@ mod tests {
 
         #[async_trait]
         impl EcrClient for MockAwsClientMatch {
-            async fn describe_images(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+            async fn describe_image_digests(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
                 Ok(vec!["123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest1".to_string()])
+            }
+            async fn describe_image_tags(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+                Ok(vec!["image_tag1".to_string()])
             }
             async fn get_repository_name_from_image(&self, _image_uri: &str) -> Result<Option<String>, ()> {
                 unimplemented!()
@@ -333,6 +395,9 @@ mod tests {
             async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> Result<String, ()> {
                 unimplemented!()
             }
+            async fn get_image_digest_from_task_id(&self, _task: &str) -> Result<Option<String>, ()> {
+                Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest1".to_string()))
+            }
         }
         impl AwsClient for MockAwsClientMatch {}
 
@@ -351,7 +416,10 @@ mod tests {
 
         #[async_trait]
         impl EcrClient for MockAwsClientNoEcrImage {
-            async fn describe_images(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+            async fn describe_image_digests(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+                Ok(vec![])
+            }
+            async fn describe_image_tags(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
                 Ok(vec![])
             }
             async fn get_repository_name_from_image(&self, _image_uri: &str) -> Result<Option<String>, ()> {
@@ -375,6 +443,9 @@ mod tests {
             async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> Result<String, ()> {
                 unimplemented!()
             }
+            async fn get_image_digest_from_task_id(&self, _task: &str) -> Result<Option<String>, ()> {
+                Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest1".to_string()))
+            }
         }
         impl AwsClient for MockAwsClientNoEcrImage {}
 
@@ -392,8 +463,11 @@ mod tests {
 
         #[async_trait]
         impl EcrClient for MockAwsClientNoServiceImage {
-            async fn describe_images(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+            async fn describe_image_digests(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
                 Ok(vec!["sha256:dummy_digest1".to_string()])
+            }
+            async fn describe_image_tags(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+                Ok(vec!["image_tag1".to_string()])
             }
             async fn get_repository_name_from_image(&self, _image_uri: &str) -> Result<Option<String>, ()> {
                 unimplemented!()
@@ -415,6 +489,9 @@ mod tests {
             }
             async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> Result<String, ()> {
                 unimplemented!()
+            }
+            async fn get_image_digest_from_task_id(&self, _task: &str) -> Result<Option<String>, ()> {
+                Ok(None)
             }
         }
         impl AwsClient for MockAwsClientNoServiceImage {}
@@ -448,7 +525,10 @@ mod tests {
 
         #[async_trait]
         impl EcrClient for MockAwsClientNoRepoName {
-            async fn describe_images(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+            async fn describe_image_digests(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+                unimplemented!()
+            }
+            async fn describe_image_tags(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
                 unimplemented!()
             }
             async fn get_repository_name_from_image(&self, _image_uri: &str) -> Result<Option<String>, ()> {
@@ -471,6 +551,9 @@ mod tests {
             }
             async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> Result<String, ()> {
                 unimplemented!()
+            }
+            async fn get_image_digest_from_task_id(&self, _task: &str) -> Result<Option<String>, ()> {
+                Ok(None)
             }
         }
         impl AwsClient for MockAwsClientNoRepoName {}
