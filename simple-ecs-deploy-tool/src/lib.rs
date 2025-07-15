@@ -190,7 +190,10 @@ impl EcrClient for AwsSdkClient {
             Ok(output) => {
                 let mut image_details = output.image_details.unwrap_or_default();
                 image_details.sort_by(|a, b| b.image_pushed_at.cmp(&a.image_pushed_at));
-                let tags = image_details.iter().filter_map(|d| d.image_tags.as_ref().iter().map(|s| s.to_string())).collect();
+                let tags    = image_details.iter()
+                    .filter_map(|d| d.image_tags.as_ref())
+                    .flat_map(|tags| tags.iter().cloned())
+                    .collect();
                 Ok(tags)
             },
             Err(_) => Err(())
