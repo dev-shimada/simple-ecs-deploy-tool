@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use async_trait::async_trait;
+
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_ecr::{Client as EcrSdkClient};
 use aws_sdk_ecs::{Client as EcsSdkClient};
@@ -46,13 +47,13 @@ pub async fn check<T: AwsClient>(
     task_definition: Option<&str>, 
     repository_name: Option<&str>, 
     mut writer: impl std::io::Write
-) -> Result<(), ()> {
+) -> anyhow::Result<()> {
     let service_task_definition_arn = client.describe_services(cluster, service).await?;
     let service_image_uri = match client.get_task_definition_image(&service_task_definition_arn).await? {
         Some(uri) => uri,
         None => {
             writeln!(writer, "No image found in service task definition: {}", service_task_definition_arn).unwrap();
-            return Err(());
+            return Err(anyhow::anyhow!("No image found in service task definition"));
         }
     };
 
@@ -62,7 +63,7 @@ pub async fn check<T: AwsClient>(
             Some(name) => name,
             None => {
                 writeln!(writer, "Could not get repository name from image URI: {}", service_image_uri).unwrap();
-                return Err(());
+                return Err(anyhow::anyhow!("Could not get repository name from image URI: {}", service_image_uri));
             }
         },
     };
@@ -72,7 +73,7 @@ pub async fn check<T: AwsClient>(
         Some(digest) => digest,
         None => {
             writeln!(writer, "No images found in ECR repository: {}", repository_name).unwrap();
-            return Err(());
+            return Err(anyhow::anyhow!("No images found in ECR repository: {}", repository_name));
         }
     };
     let image_tags = client.describe_image_tags(&repository_name).await?;
@@ -80,7 +81,7 @@ pub async fn check<T: AwsClient>(
         Some(tags) => tags,
         None => {
             writeln!(writer, "No images found in ECR repository: {}", repository_name).unwrap();
-            return Err(());
+            return Err(anyhow::anyhow!("No images found in ECR repository: {}", repository_name));
         }
     };
     let service_image_digest = client.get_image_digest_from_task_id(task_definition.unwrap_or(&service_task_definition_arn)).await?; 
@@ -88,7 +89,7 @@ pub async fn check<T: AwsClient>(
         Some(digest) => digest,
         None => {
             writeln!(writer, "No image found in service task definition: {}", service_task_definition_arn).unwrap();
-            return Err(());
+            return Err(anyhow::anyhow!("No image found in service task definition: {}", service_task_definition_arn));
         }
     };
 
@@ -133,18 +134,18 @@ pub trait AwsClient: EcrClient + EcsClient {}
 
 #[async_trait]
 pub trait EcrClient {
-    async fn describe_image_digests(&self, repository_name: &str) -> Result<Vec<String>, ()>;
-    async fn describe_image_tags(&self, repository_name: &str) -> Result<Vec<String>, ()>;
-    async fn get_repository_name_from_image(&self, image_uri: &str) -> Result<Option<String>, ()>;
+    async fn describe_image_digests(&self, repository_name: &str) -> anyhow::Result<Vec<String>>;
+    async fn describe_image_tags(&self, repository_name: &str) -> anyhow::Result<Vec<String>>;
+    async fn get_repository_name_from_image(&self, image_uri: &str) -> anyhow::Result<Option<String>>;
 }
 
 #[async_trait]
 pub trait EcsClient {
-    async fn describe_task_definition(&self, task_definition: &str) -> Result<String, ()>;
-    async fn describe_services(&self, cluster: &str, service: &str) -> Result<String, ()>;
-    async fn get_task_definition_image(&self, task_definition_arn: &str) -> Result<Option<String>, ()>;
-    async fn get_task_definition_family_from_arn(&self, task_definition_arn: &str) -> Result<String, ()>;
-    async fn get_image_digest_from_task_id(&self, task: &str) -> Result<Option<String>, ()>;
+    async fn describe_task_definition(&self, task_definition: &str) -> anyhow::Result<String>;
+    async fn describe_services(&self, cluster: &str, service: &str) -> anyhow::Result<String>;
+    async fn get_task_definition_image(&self, task_definition_arn: &str) -> anyhow::Result<Option<String>>;
+    async fn get_task_definition_family_from_arn(&self, task_definition_arn: &str) -> anyhow::Result<String>;
+    async fn get_image_digest_from_task_id(&self, task: &str) -> anyhow::Result<Option<String>>;
 }
 
 pub struct AwsSdkClient {
@@ -171,36 +172,26 @@ impl AwsSdkClient {
 
 #[async_trait]
 impl EcrClient for AwsSdkClient {
-    async fn describe_image_digests(&self, repository_name: &str) -> Result<Vec<String>, ()> {
-        let resp = self.ecr_client.describe_images().repository_name(repository_name).send().await;
-        match resp {
-            Ok(output) => {
-                let mut image_details = output.image_details.unwrap_or_default();
-                image_details.sort_by(|a, b| b.image_pushed_at.cmp(&a.image_pushed_at));
-                let digests = image_details.iter().filter_map(|d| d.image_digest.as_ref().map(|s| s.to_string())).collect();
-                Ok(digests)
-            },
-            Err(_) => Err(())
-        }
+    async fn describe_image_digests(&self, repository_name: &str) -> anyhow::Result<Vec<String>> {
+        let resp = self.ecr_client.describe_images().repository_name(repository_name).send().await?;
+        let mut image_details = resp.image_details.unwrap_or_default();
+        image_details.sort_by(|a, b| b.image_pushed_at.cmp(&a.image_pushed_at));
+        let digests = image_details.iter().filter_map(|d| d.image_digest.as_ref().map(|s| s.to_string())).collect();
+        Ok(digests)
     }
 
-    async fn describe_image_tags(&self, repository_name: &str) -> Result<Vec<String>, ()> {
-        let resp = self.ecr_client.describe_images().repository_name(repository_name).send().await;
-        match resp {
-            Ok(output) => {
-                let mut image_details = output.image_details.unwrap_or_default();
-                image_details.sort_by(|a, b| b.image_pushed_at.cmp(&a.image_pushed_at));
-                let tags    = image_details.iter()
-                    .filter_map(|d| d.image_tags.as_ref())
-                    .flat_map(|tags| tags.iter().cloned())
-                    .collect();
-                Ok(tags)
-            },
-            Err(_) => Err(())
-        }
+    async fn describe_image_tags(&self, repository_name: &str) -> anyhow::Result<Vec<String>> {
+        let resp = self.ecr_client.describe_images().repository_name(repository_name).send().await?;
+        let mut image_details = resp.image_details.unwrap_or_default();
+        image_details.sort_by(|a, b| b.image_pushed_at.cmp(&a.image_pushed_at));
+        let tags = image_details.iter()
+            .filter_map(|d| d.image_tags.as_ref())
+            .flat_map(|tags| tags.iter().cloned())
+            .collect();
+        Ok(tags)
     }
 
-    async fn get_repository_name_from_image(&self, image_uri: &str) -> Result<Option<String>, ()> {
+    async fn get_repository_name_from_image(&self, image_uri: &str) -> anyhow::Result<Option<String>> {
         let repo_name = image_uri.split('/').nth(1).and_then(|s| s.split('@').next()).map(|s| s.to_string());
         Ok(repo_name)
     }
@@ -208,69 +199,44 @@ impl EcrClient for AwsSdkClient {
 
 #[async_trait]
 impl EcsClient for AwsSdkClient {
-    async fn describe_task_definition(&self, task_definition: &str) -> Result<String, ()> {
-        let resp = self.ecs_client.describe_task_definition().task_definition(task_definition).send().await;
-        match resp {
-            Ok(output) => {
-                let arn = output.task_definition.and_then(|td| td.task_definition_arn).unwrap_or_default();
-                Ok(arn)
-            },
-            Err(_) => Err(())
-        }
+    async fn describe_task_definition(&self, task_definition: &str) -> anyhow::Result<String> {
+        let resp = self.ecs_client.describe_task_definition().task_definition(task_definition).send().await?;
+        let arn = resp.task_definition.and_then(|td| td.task_definition_arn).unwrap_or_default();
+        Ok(arn)
     }
 
-    async fn describe_services(&self, cluster: &str, service: &str) -> Result<String, ()> {
-        let resp = self.ecs_client.describe_services().cluster(cluster).services(service).send().await;
-        match resp {
-            Ok(output) => {
-                let service = output.services.unwrap_or_default().into_iter().next();
-                let task_definition = service.and_then(|s| s.task_definition).unwrap_or_default();
-                Ok(task_definition)
-            },
-            Err(_) => Err(())
-        }
+    async fn describe_services(&self, cluster: &str, service: &str) -> anyhow::Result<String> {
+        let resp = self.ecs_client.describe_services().cluster(cluster).services(service).send().await?;
+        let service = resp.services.unwrap_or_default().into_iter().next();
+        let task_definition = service.and_then(|s| s.task_definition).unwrap_or_default();
+        Ok(task_definition)
     }
 
-    async fn get_task_definition_image(&self, task_definition_arn: &str) -> Result<Option<String>, ()> {
-        let resp = self.ecs_client.describe_task_definition().task_definition(task_definition_arn).send().await;
-        match resp {
-            Ok(output) => {
-                let image = output.task_definition
-                    .and_then(|td| td.container_definitions)
-                    .and_then(|mut cds| cds.pop())
-                    .and_then(|cd| cd.image);
-                Ok(image)
-            },
-            Err(_) => Err(())
-        }
+    async fn get_task_definition_image(&self, task_definition_arn: &str) -> anyhow::Result<Option<String>> {
+        let resp = self.ecs_client.describe_task_definition().task_definition(task_definition_arn).send().await?;
+        let image = resp.task_definition
+            .and_then(|td| td.container_definitions)
+            .and_then(|mut cds| cds.pop())
+            .and_then(|cd| cd.image);
+        Ok(image)
     }
 
-    async fn get_task_definition_family_from_arn(&self, task_definition_arn: &str) -> Result<String, ()> {
+    async fn get_task_definition_family_from_arn(&self, task_definition_arn: &str) -> anyhow::Result<String> {
         let family = task_definition_arn.split('/').nth(1).and_then(|s| s.split(':').next()).map(|s| s.to_string());
         Ok(family.unwrap_or_default())
     }
 
-    async fn get_image_digest_from_task_id(&self, task: &str) -> Result<Option<String>, ()> {
-        let resp = self.ecs_client.describe_tasks().tasks(task).send().await;
-        match resp {
-            Ok(output) => {
-                let tasks = output.tasks;
-                if let Some(task) = tasks.unwrap().get(0) {
-                    if let Some(container) = task.containers().get(0) {
-                        if let Some(digest) = &container.image_digest {
-                            return Ok(Some(digest.to_string()));
-                        } else {
-                            return Ok(None);
-                        }
-                    } else {
-                        return Ok(None);
-                    }
-                } else {
-                    Ok(None)
+    async fn get_image_digest_from_task_id(&self, task: &str) -> anyhow::Result<Option<String>> {
+        let resp = self.ecs_client.describe_tasks().tasks(task).send().await?;
+        let tasks = resp.tasks;
+        if let Some(task) = tasks.unwrap().get(0) {
+            if let Some(container) = task.containers().get(0) {
+                if let Some(digest) = &container.image_digest {
+                    return Ok(Some(digest.to_string()));
                 }
-            },
-            Err(_) => Err(())
+            }
         }
+        Ok(None)
     }
 }
 
@@ -284,7 +250,7 @@ mod tests {
 
     #[async_trait]
     impl EcrClient for MockAwsClient {
-        async fn describe_image_digests(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+        async fn describe_image_digests(&self, _repository_name: &str) -> anyhow::Result<Vec<String>> {
             Ok(vec![
                 "sha256:dummy_digest1".to_string(),
                 "sha256:dummy_digest2".to_string(),
@@ -293,7 +259,7 @@ mod tests {
                 "sha256:dummy_digest5".to_string(),
             ])
         }
-        async fn describe_image_tags(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+        async fn describe_image_tags(&self, _repository_name: &str) -> anyhow::Result<Vec<String>> {
             Ok(vec![
                 "image_tag1".to_string(),
                 "image_tag2".to_string(),
@@ -303,22 +269,22 @@ mod tests {
             ])
         }
 
-        async fn get_repository_name_from_image(&self, _image_uri: &str) -> Result<Option<String>, ()> {
+        async fn get_repository_name_from_image(&self, _image_uri: &str) -> anyhow::Result<Option<String>> {
             Ok(Some("dummy-repo".to_string()))
         }
     }
 
     #[async_trait]
     impl EcsClient for MockAwsClient {
-        async fn describe_task_definition(&self, _task_definition: &str) -> Result<String, ()> {
+        async fn describe_task_definition(&self, _task_definition: &str) -> anyhow::Result<String> {
             Ok("arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:2".to_string())
         }
 
-        async fn describe_services(&self, _cluster: &str, _service: &str) -> Result<String, ()> {
+        async fn describe_services(&self, _cluster: &str, _service: &str) -> anyhow::Result<String> {
             Ok("arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:1".to_string())
         }
 
-        async fn get_task_definition_image(&self, task_definition_arn: &str) -> Result<Option<String>, ()> {
+        async fn get_task_definition_image(&self, task_definition_arn: &str) -> anyhow::Result<Option<String>> {
             if task_definition_arn == "arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:1" {
                 Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest_from_service".to_string()))
             } else {
@@ -326,10 +292,10 @@ mod tests {
             }
         }
 
-        async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> Result<String, ()> {
+        async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> anyhow::Result<String> {
             Ok("dummy-task-def".to_string())
         }
-        async fn get_image_digest_from_task_id(&self, _task: &str) -> Result<Option<String>, ()> {
+        async fn get_image_digest_from_task_id(&self, _task: &str) -> anyhow::Result<Option<String>> {
             Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest_from_service".to_string()))
         }
     }
@@ -371,34 +337,34 @@ mod tests {
 
         #[async_trait]
         impl EcrClient for MockAwsClientMatch {
-            async fn describe_image_digests(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+            async fn describe_image_digests(&self, _repository_name: &str) -> anyhow::Result<Vec<String>> {
                 Ok(vec!["123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest1".to_string()])
             }
-            async fn describe_image_tags(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+            async fn describe_image_tags(&self, _repository_name: &str) -> anyhow::Result<Vec<String>> {
                 Ok(vec!["image_tag1".to_string()])
             }
-            async fn get_repository_name_from_image(&self, _image_uri: &str) -> Result<Option<String>, ()> {
+            async fn get_repository_name_from_image(&self, _image_uri: &str) -> anyhow::Result<Option<String>> {
                 unimplemented!()
             }
         }
 
         #[async_trait]
         impl EcsClient for MockAwsClientMatch {
-            async fn describe_task_definition(&self, _task_definition: &str) -> Result<String, ()> {
+            async fn describe_task_definition(&self, _task_definition: &str) -> anyhow::Result<String> {
                 Ok("arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:1".to_string())
             }
 
-            async fn describe_services(&self, _cluster: &str, _service: &str) -> Result<String, ()> {
+            async fn describe_services(&self, _cluster: &str, _service: &str) -> anyhow::Result<String> {
                 Ok("arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:1".to_string())
             }
 
-            async fn get_task_definition_image(&self, _task_definition_arn: &str) -> Result<Option<String>, ()> {
+            async fn get_task_definition_image(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
                 Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest1".to_string()))
             }
-            async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> Result<String, ()> {
+            async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> anyhow::Result<String> {
                 unimplemented!()
             }
-            async fn get_image_digest_from_task_id(&self, _task: &str) -> Result<Option<String>, ()> {
+            async fn get_image_digest_from_task_id(&self, _task: &str) -> anyhow::Result<Option<String>> {
                 Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest1".to_string()))
             }
         }
@@ -419,34 +385,34 @@ mod tests {
 
         #[async_trait]
         impl EcrClient for MockAwsClientNoEcrImage {
-            async fn describe_image_digests(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+            async fn describe_image_digests(&self, _repository_name: &str) -> anyhow::Result<Vec<String>> {
                 Ok(vec![])
             }
-            async fn describe_image_tags(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+            async fn describe_image_tags(&self, _repository_name: &str) -> anyhow::Result<Vec<String>> {
                 Ok(vec![])
             }
-            async fn get_repository_name_from_image(&self, _image_uri: &str) -> Result<Option<String>, ()> {
+            async fn get_repository_name_from_image(&self, _image_uri: &str) -> anyhow::Result<Option<String>> {
                 Ok(Some("dummy-repo".to_string()))
             }
         }
 
         #[async_trait]
         impl EcsClient for MockAwsClientNoEcrImage {
-            async fn describe_task_definition(&self, _task_definition: &str) -> Result<String, ()> {
+            async fn describe_task_definition(&self, _task_definition: &str) -> anyhow::Result<String> {
                 unimplemented!()
             }
 
-            async fn describe_services(&self, _cluster: &str, _service: &str) -> Result<String, ()> {
+            async fn describe_services(&self, _cluster: &str, _service: &str) -> anyhow::Result<String> {
                 Ok("arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:1".to_string())
             }
 
-            async fn get_task_definition_image(&self, _task_definition_arn: &str) -> Result<Option<String>, ()> {
+            async fn get_task_definition_image(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
                 Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest1".to_string()))
             }
-            async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> Result<String, ()> {
+            async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> anyhow::Result<String> {
                 unimplemented!()
             }
-            async fn get_image_digest_from_task_id(&self, _task: &str) -> Result<Option<String>, ()> {
+            async fn get_image_digest_from_task_id(&self, _task: &str) -> anyhow::Result<Option<String>> {
                 Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest1".to_string()))
             }
         }
@@ -466,34 +432,34 @@ mod tests {
 
         #[async_trait]
         impl EcrClient for MockAwsClientNoServiceImage {
-            async fn describe_image_digests(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+            async fn describe_image_digests(&self, _repository_name: &str) -> anyhow::Result<Vec<String>> {
                 Ok(vec!["sha256:dummy_digest1".to_string()])
             }
-            async fn describe_image_tags(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+            async fn describe_image_tags(&self, _repository_name: &str) -> anyhow::Result<Vec<String>> {
                 Ok(vec!["image_tag1".to_string()])
             }
-            async fn get_repository_name_from_image(&self, _image_uri: &str) -> Result<Option<String>, ()> {
+            async fn get_repository_name_from_image(&self, _image_uri: &str) -> anyhow::Result<Option<String>> {
                 unimplemented!()
             }
         }
 
         #[async_trait]
         impl EcsClient for MockAwsClientNoServiceImage {
-            async fn describe_task_definition(&self, _task_definition: &str) -> Result<String, ()> {
+            async fn describe_task_definition(&self, _task_definition: &str) -> anyhow::Result<String> {
                 unimplemented!()
             }
 
-            async fn describe_services(&self, _cluster: &str, _service: &str) -> Result<String, ()> {
+            async fn describe_services(&self, _cluster: &str, _service: &str) -> anyhow::Result<String> {
                 Ok("arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:1".to_string())
             }
 
-            async fn get_task_definition_image(&self, _task_definition_arn: &str) -> Result<Option<String>, ()> {
+            async fn get_task_definition_image(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
                 Ok(None)
             }
-            async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> Result<String, ()> {
+            async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> anyhow::Result<String> {
                 unimplemented!()
             }
-            async fn get_image_digest_from_task_id(&self, _task: &str) -> Result<Option<String>, ()> {
+            async fn get_image_digest_from_task_id(&self, _task: &str) -> anyhow::Result<Option<String>> {
                 Ok(None)
             }
         }
@@ -528,34 +494,34 @@ mod tests {
 
         #[async_trait]
         impl EcrClient for MockAwsClientNoRepoName {
-            async fn describe_image_digests(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+            async fn describe_image_digests(&self, _repository_name: &str) -> anyhow::Result<Vec<String>> {
                 unimplemented!()
             }
-            async fn describe_image_tags(&self, _repository_name: &str) -> Result<Vec<String>, ()> {
+            async fn describe_image_tags(&self, _repository_name: &str) -> anyhow::Result<Vec<String>> {
                 unimplemented!()
             }
-            async fn get_repository_name_from_image(&self, _image_uri: &str) -> Result<Option<String>, ()> {
+            async fn get_repository_name_from_image(&self, _image_uri: &str) -> anyhow::Result<Option<String>> {
                 Ok(None)
             }
         }
 
         #[async_trait]
         impl EcsClient for MockAwsClientNoRepoName {
-            async fn describe_task_definition(&self, _task_definition: &str) -> Result<String, ()> {
+            async fn describe_task_definition(&self, _task_definition: &str) -> anyhow::Result<String> {
                 unimplemented!()
             }
 
-            async fn describe_services(&self, _cluster: &str, _service: &str) -> Result<String, ()> {
+            async fn describe_services(&self, _cluster: &str, _service: &str) -> anyhow::Result<String> {
                 Ok("arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:1".to_string())
             }
 
-            async fn get_task_definition_image(&self, _task_definition_arn: &str) -> Result<Option<String>, ()> {
+            async fn get_task_definition_image(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
                 Ok(Some("invalid-image-uri".to_string()))
             }
-            async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> Result<String, ()> {
+            async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> anyhow::Result<String> {
                 unimplemented!()
             }
-            async fn get_image_digest_from_task_id(&self, _task: &str) -> Result<Option<String>, ()> {
+            async fn get_image_digest_from_task_id(&self, _task: &str) -> anyhow::Result<Option<String>> {
                 Ok(None)
             }
         }
