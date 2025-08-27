@@ -20,7 +20,7 @@
 	"mounts": [
 		"source=${localWorkspaceFolder},target=/workspace,type=bind",
 		"source=${env:HOME}/.aws,target=/root/.aws,type=bind,readOnly=true",
-		"source=${env:HOME}/.config/gcloud/application_default_credentials.json,target=/root/.config/gcloud/application_default_credentials.json,type=bind,readOnly=true"
+		"source=${env:HOME}/.claude,target=/root/.claude,type=bind"
 	],
 	"forwardPorts": [],
 	"remoteUser": "root",

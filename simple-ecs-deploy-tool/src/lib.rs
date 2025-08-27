@@ -35,7 +35,10 @@ pub async fn run() {
     match &cli.command {
         Commands::Check { cluster, service, task_definition, repository_name } => {
             let client = AwsSdkClient::new(cli.profile.as_deref()).await;
-            check(&client, cluster, service, task_definition.as_deref(), repository_name.as_deref(), &mut std::io::stdout()).await.unwrap();
+            if let Err(e) = check(&client, cluster, service, task_definition.as_deref(), repository_name.as_deref(), &mut std::io::stdout()).await {
+                eprintln!("Error: {:?}", e);
+                std::process::exit(1);
+            }
         }
     }
 }
@@ -84,12 +87,18 @@ pub async fn check<T: AwsClient>(
             return Err(anyhow::anyhow!("No images found in ECR repository: {}", repository_name));
         }
     };
-    let service_image_digest = client.get_image_digest_from_task_id(task_definition.unwrap_or(&service_task_definition_arn)).await?; 
+    let service_image_digest = client.get_image_digest_from_task_definition(&service_task_definition_arn).await?; 
     let service_image_digest = match service_image_digest {
         Some(digest) => digest,
         None => {
-            writeln!(writer, "No image found in service task definition: {}", service_task_definition_arn).unwrap();
-            return Err(anyhow::anyhow!("No image found in service task definition: {}", service_task_definition_arn));
+            // Get the image URI to provide more context
+            let image_uri = client.get_task_definition_image(&service_task_definition_arn).await?;
+            writeln!(writer, "Could not resolve image digest from service task definition: {}", service_task_definition_arn).unwrap();
+            if let Some(uri) = image_uri {
+                writeln!(writer, "Image URI in task definition: {}", uri).unwrap();
+            }
+            writeln!(writer, "This might be because the image tag doesn't exist in ECR or the task definition has no image").unwrap();
+            return Err(anyhow::anyhow!("Could not resolve image digest from service task definition"));
         }
     };
 
@@ -102,13 +111,38 @@ pub async fn check<T: AwsClient>(
         writeln!(writer, "Image digest is up to date.").unwrap();
     }
 
-    // Compare the latest image tag with the service image tag
-    if !image_tags.is_empty() && latest_image_tags != &service_image_digest {
-        writeln!(writer, "Image tag mismatch:").unwrap();
-        writeln!(writer, "  Latest ECR: {}", latest_image_tags).unwrap();
-        writeln!(writer, "  Service image: {}", service_image_digest).unwrap();
+    // Get the service image tag for comparison
+    let service_image_uri = client.get_task_definition_image(&service_task_definition_arn).await?;
+    let service_image_tag = if let Some(uri) = service_image_uri {
+        // Extract tag from image URI (format: registry/repo:tag or registry/repo@digest)
+        if let Some(tag_part) = uri.split(':').last() {
+            if !tag_part.contains('@') {
+                Some(tag_part.to_string())
+            } else {
+                None // Image URI contains digest, no tag
+            }
+        } else {
+            None
+        }
     } else {
-        writeln!(writer, "Image tag is up to date.").unwrap();
+        None
+    };
+
+    // Compare the latest image tag with the service image tag
+    if !image_tags.is_empty() {
+        if let Some(service_tag) = &service_image_tag {
+            if latest_image_tags != service_tag {
+                writeln!(writer, "Image tag mismatch:").unwrap();
+                writeln!(writer, "  Latest ECR: {}", latest_image_tags).unwrap();
+                writeln!(writer, "  Service image: {}", service_tag).unwrap();
+            } else {
+                writeln!(writer, "Image tag is up to date.").unwrap();
+            }
+        } else {
+            writeln!(writer, "Service image uses digest instead of tag - skipping tag comparison.").unwrap();
+        }
+    } else {
+        writeln!(writer, "No tags found in ECR repository.").unwrap();
     }
 
     // Check the task definition
@@ -145,7 +179,7 @@ pub trait EcsClient {
     async fn describe_services(&self, cluster: &str, service: &str) -> anyhow::Result<String>;
     async fn get_task_definition_image(&self, task_definition_arn: &str) -> anyhow::Result<Option<String>>;
     async fn get_task_definition_family_from_arn(&self, task_definition_arn: &str) -> anyhow::Result<String>;
-    async fn get_image_digest_from_task_id(&self, task: &str) -> anyhow::Result<Option<String>>;
+    async fn get_image_digest_from_task_definition(&self, task_definition_arn: &str) -> anyhow::Result<Option<String>>;
 }
 
 pub struct AwsSdkClient {
@@ -192,8 +226,13 @@ impl EcrClient for AwsSdkClient {
     }
 
     async fn get_repository_name_from_image(&self, image_uri: &str) -> anyhow::Result<Option<String>> {
-        let repo_name = image_uri.split('/').nth(1).and_then(|s| s.split('@').next()).map(|s| s.to_string());
-        Ok(repo_name)
+        // Parse ECR image URI format: account.dkr.ecr.region.amazonaws.com/repository:tag or @digest
+        if let Some(path_part) = image_uri.split('/').nth(1) {
+            let repo_name = path_part.split('@').next().unwrap_or(path_part).split(':').next().unwrap_or(path_part).to_string();
+            Ok(Some(repo_name))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -226,17 +265,60 @@ impl EcsClient for AwsSdkClient {
         Ok(family.unwrap_or_default())
     }
 
-    async fn get_image_digest_from_task_id(&self, task: &str) -> anyhow::Result<Option<String>> {
-        let resp = self.ecs_client.describe_tasks().tasks(task).send().await?;
-        let tasks = resp.tasks;
-        if let Some(task) = tasks.unwrap().get(0) {
-            if let Some(container) = task.containers().get(0) {
-                if let Some(digest) = &container.image_digest {
-                    return Ok(Some(digest.to_string()));
+    async fn get_image_digest_from_task_definition(&self, task_definition_arn: &str) -> anyhow::Result<Option<String>> {
+        let resp = self.ecs_client.describe_task_definition().task_definition(task_definition_arn).send().await?;
+        let image = resp.task_definition
+            .and_then(|td| td.container_definitions)
+            .and_then(|mut cds| cds.pop())
+            .and_then(|cd| cd.image);
+        
+        if let Some(image_uri) = image {
+            // If the image URI contains a digest, extract it
+            if let Some(digest_part) = image_uri.split('@').nth(1) {
+                Ok(Some(digest_part.to_string()))
+            } else {
+                // If no digest in URI, we need to resolve the tag to a digest via ECR
+                let repo_name = match self.get_repository_name_from_image(&image_uri).await? {
+                    Some(name) => name,
+                    None => return Ok(None),
+                };
+                
+                // Get the tag from the image URI
+                let tag = if let Some(tag_part) = image_uri.split(':').last() {
+                    if !tag_part.contains('@') && tag_part != "latest" {
+                        Some(tag_part)
+                    } else {
+                        Some("latest")
+                    }
+                } else {
+                    Some("latest")
+                };
+                
+                if let Some(tag) = tag {
+                    // Query ECR to get the digest for this tag
+                    match self.ecr_client.describe_images()
+                        .repository_name(&repo_name)
+                        .image_ids(aws_sdk_ecr::types::ImageIdentifier::builder().image_tag(tag).build())
+                        .send().await {
+                        Ok(resp) => {
+                            if let Some(image_detail) = resp.image_details.unwrap_or_default().first() {
+                                if let Some(digest) = &image_detail.image_digest {
+                                    return Ok(Some(digest.clone()));
+                                }
+                            }
+                        },
+                        Err(_) => {
+                            // Image not found for this tag, return None rather than propagating error
+                            return Ok(None);
+                        }
+                    }
                 }
+                
+                Ok(None)
             }
+        } else {
+            Ok(None)
         }
-        Ok(None)
     }
 }
 
@@ -286,7 +368,7 @@ mod tests {
 
         async fn get_task_definition_image(&self, task_definition_arn: &str) -> anyhow::Result<Option<String>> {
             if task_definition_arn == "arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:1" {
-                Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest_from_service".to_string()))
+                Ok(Some("sha256:dummy_digest_from_service".to_string()))
             } else {
                 Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest_from_latest_task_def".to_string()))
             }
@@ -295,8 +377,8 @@ mod tests {
         async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> anyhow::Result<String> {
             Ok("dummy-task-def".to_string())
         }
-        async fn get_image_digest_from_task_id(&self, _task: &str) -> anyhow::Result<Option<String>> {
-            Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest_from_service".to_string()))
+        async fn get_image_digest_from_task_definition(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
+            Ok(Some("sha256:dummy_digest_from_service".to_string()))
         }
     }
 
@@ -325,7 +407,7 @@ mod tests {
         let output = String::from_utf8(writer).unwrap();
         assert!(output.contains("Image digest mismatch:"));
         assert!(output.contains("  Latest ECR: sha256:dummy_digest1"));
-        assert!(output.contains("  Service image: 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest_from_service"));
+        assert!(output.contains("  Service image: sha256:dummy_digest_from_service"));
         assert!(output.contains("Task definition mismatch:"));
         assert!(output.contains("  Latest: arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:2"));
         assert!(output.contains("  Service: arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:1"));
@@ -338,7 +420,7 @@ mod tests {
         #[async_trait]
         impl EcrClient for MockAwsClientMatch {
             async fn describe_image_digests(&self, _repository_name: &str) -> anyhow::Result<Vec<String>> {
-                Ok(vec!["123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest1".to_string()])
+                Ok(vec!["sha256:dummy_digest1".to_string()])
             }
             async fn describe_image_tags(&self, _repository_name: &str) -> anyhow::Result<Vec<String>> {
                 Ok(vec!["image_tag1".to_string()])
@@ -359,13 +441,13 @@ mod tests {
             }
 
             async fn get_task_definition_image(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
-                Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest1".to_string()))
+                Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo:image_tag1".to_string()))
             }
             async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> anyhow::Result<String> {
                 unimplemented!()
             }
-            async fn get_image_digest_from_task_id(&self, _task: &str) -> anyhow::Result<Option<String>> {
-                Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest1".to_string()))
+            async fn get_image_digest_from_task_definition(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
+                Ok(Some("sha256:dummy_digest1".to_string()))
             }
         }
         impl AwsClient for MockAwsClientMatch {}
@@ -407,13 +489,13 @@ mod tests {
             }
 
             async fn get_task_definition_image(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
-                Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest1".to_string()))
+                Ok(Some("sha256:dummy_digest1".to_string()))
             }
             async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> anyhow::Result<String> {
                 unimplemented!()
             }
-            async fn get_image_digest_from_task_id(&self, _task: &str) -> anyhow::Result<Option<String>> {
-                Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest1".to_string()))
+            async fn get_image_digest_from_task_definition(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
+                Ok(Some("sha256:dummy_digest1".to_string()))
             }
         }
         impl AwsClient for MockAwsClientNoEcrImage {}
@@ -459,7 +541,7 @@ mod tests {
             async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> anyhow::Result<String> {
                 unimplemented!()
             }
-            async fn get_image_digest_from_task_id(&self, _task: &str) -> anyhow::Result<Option<String>> {
+            async fn get_image_digest_from_task_definition(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
                 Ok(None)
             }
         }
@@ -482,7 +564,7 @@ mod tests {
         let output = String::from_utf8(writer).unwrap();
         assert!(output.contains("Image digest mismatch:"));
         assert!(output.contains("  Latest ECR: sha256:dummy_digest1"));
-        assert!(output.contains("  Service image: 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest_from_service"));
+        assert!(output.contains("  Service image: sha256:dummy_digest_from_service"));
         assert!(output.contains("Task definition mismatch:"));
         assert!(output.contains("  Latest: arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:2"));
         assert!(output.contains("  Service: arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:1"));
@@ -521,7 +603,7 @@ mod tests {
             async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> anyhow::Result<String> {
                 unimplemented!()
             }
-            async fn get_image_digest_from_task_id(&self, _task: &str) -> anyhow::Result<Option<String>> {
+            async fn get_image_digest_from_task_definition(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
                 Ok(None)
             }
         }
