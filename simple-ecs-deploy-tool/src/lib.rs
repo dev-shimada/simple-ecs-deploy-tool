@@ -27,6 +27,15 @@ enum Commands {
         #[clap(long)]
         repository_name: Option<String>,
     },
+    /// 指定されたサービスに新しいタスク定義リビジョンをデプロイします
+    Deploy {
+        #[clap(long)]
+        cluster: String,
+        #[clap(long)]
+        service: String,
+        #[clap(long)]
+        task_definition: Option<String>,
+    },
 }
 
 pub async fn run() {
@@ -40,7 +49,42 @@ pub async fn run() {
                 std::process::exit(1);
             }
         }
+        Commands::Deploy { cluster, service, task_definition } => {
+            let client = AwsSdkClient::new(cli.profile.as_deref()).await;
+            if let Err(e) = deploy(&client, cluster, service, task_definition.as_deref(), &mut std::io::stdout()).await {
+                eprintln!("Error: {:?}", e);
+                std::process::exit(1);
+            }
+        }
     }
+}
+
+pub async fn deploy<T: AwsClient>(
+    client: &T,
+    cluster: &str,
+    service: &str,
+    task_definition: Option<&str>,
+    mut writer: impl std::io::Write
+) -> anyhow::Result<()> {
+    let latest_task_definition_arn = if let Some(task_def) = task_definition {
+        client.describe_task_definition(task_def).await?
+    } else {
+        let service_task_definition_arn = client.describe_services(cluster, service).await?;
+        let task_def_family = client.get_task_definition_family_from_arn(&service_task_definition_arn).await?;
+        client.describe_task_definition(&task_def_family).await?
+    };
+
+    writeln!(writer, "Deploying service '{}' in cluster '{}' with task definition: {}", service, cluster, latest_task_definition_arn).unwrap();
+    
+    let deployment_id = client.update_service(cluster, service, &latest_task_definition_arn).await?;
+    
+    if !deployment_id.is_empty() {
+        writeln!(writer, "Deployment started with ID: {}", deployment_id).unwrap();
+    } else {
+        writeln!(writer, "Deployment started successfully").unwrap();
+    }
+    
+    Ok(())
 }
 
 pub async fn check<T: AwsClient>(
@@ -180,6 +224,7 @@ pub trait EcsClient {
     async fn get_task_definition_image(&self, task_definition_arn: &str) -> anyhow::Result<Option<String>>;
     async fn get_task_definition_family_from_arn(&self, task_definition_arn: &str) -> anyhow::Result<String>;
     async fn get_image_digest_from_task_definition(&self, task_definition_arn: &str) -> anyhow::Result<Option<String>>;
+    async fn update_service(&self, cluster: &str, service: &str, task_definition: &str) -> anyhow::Result<String>;
 }
 
 pub struct AwsSdkClient {
@@ -320,6 +365,24 @@ impl EcsClient for AwsSdkClient {
             Ok(None)
         }
     }
+
+    async fn update_service(&self, cluster: &str, service: &str, task_definition: &str) -> anyhow::Result<String> {
+        let resp = self.ecs_client
+            .update_service()
+            .cluster(cluster)
+            .service(service)
+            .task_definition(task_definition)
+            .send()
+            .await?;
+        
+        let deployment_id = resp.service
+            .and_then(|s| s.deployments)
+            .and_then(|mut deployments| deployments.pop())
+            .and_then(|d| d.id)
+            .unwrap_or_default();
+        
+        Ok(deployment_id)
+    }
 }
 
 impl AwsClient for AwsSdkClient {}
@@ -379,6 +442,10 @@ mod tests {
         }
         async fn get_image_digest_from_task_definition(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
             Ok(Some("sha256:dummy_digest_from_service".to_string()))
+        }
+
+        async fn update_service(&self, _cluster: &str, _service: &str, _task_definition: &str) -> anyhow::Result<String> {
+            Ok("deployment-123".to_string())
         }
     }
 
@@ -449,6 +516,10 @@ mod tests {
             async fn get_image_digest_from_task_definition(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
                 Ok(Some("sha256:dummy_digest1".to_string()))
             }
+
+            async fn update_service(&self, _cluster: &str, _service: &str, _task_definition: &str) -> anyhow::Result<String> {
+                Ok("deployment-456".to_string())
+            }
         }
         impl AwsClient for MockAwsClientMatch {}
 
@@ -497,6 +568,10 @@ mod tests {
             async fn get_image_digest_from_task_definition(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
                 Ok(Some("sha256:dummy_digest1".to_string()))
             }
+
+            async fn update_service(&self, _cluster: &str, _service: &str, _task_definition: &str) -> anyhow::Result<String> {
+                Ok("deployment-789".to_string())
+            }
         }
         impl AwsClient for MockAwsClientNoEcrImage {}
 
@@ -543,6 +618,10 @@ mod tests {
             }
             async fn get_image_digest_from_task_definition(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
                 Ok(None)
+            }
+
+            async fn update_service(&self, _cluster: &str, _service: &str, _task_definition: &str) -> anyhow::Result<String> {
+                Ok("deployment-abc".to_string())
             }
         }
         impl AwsClient for MockAwsClientNoServiceImage {}
@@ -606,6 +685,10 @@ mod tests {
             async fn get_image_digest_from_task_definition(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
                 Ok(None)
             }
+
+            async fn update_service(&self, _cluster: &str, _service: &str, _task_definition: &str) -> anyhow::Result<String> {
+                Ok("deployment-xyz".to_string())
+            }
         }
         impl AwsClient for MockAwsClientNoRepoName {}
 
@@ -615,5 +698,27 @@ mod tests {
         assert!(result.is_err());
         let output = String::from_utf8(writer).unwrap();
         assert!(output.contains("Could not get repository name from image URI: invalid-image-uri"));
+    }
+
+    #[tokio::test]
+    async fn deploy_subcommand_runs_successfully() {
+        let mock_aws_client = MockAwsClient;
+        let mut writer = Vec::new();
+        let result = deploy(&mock_aws_client, "dummy-cluster", "dummy-service", Some("dummy-task-def"), &mut writer).await;
+        assert!(result.is_ok());
+        let output = String::from_utf8(writer).unwrap();
+        assert!(output.contains("Deploying service 'dummy-service' in cluster 'dummy-cluster'"));
+        assert!(output.contains("Deployment started with ID: deployment-123"));
+    }
+
+    #[tokio::test]
+    async fn deploy_subcommand_runs_without_task_definition() {
+        let mock_aws_client = MockAwsClient;
+        let mut writer = Vec::new();
+        let result = deploy(&mock_aws_client, "dummy-cluster", "dummy-service", None, &mut writer).await;
+        assert!(result.is_ok());
+        let output = String::from_utf8(writer).unwrap();
+        assert!(output.contains("Deploying service 'dummy-service' in cluster 'dummy-cluster'"));
+        assert!(output.contains("Deployment started with ID: deployment-123"));
     }
 }
