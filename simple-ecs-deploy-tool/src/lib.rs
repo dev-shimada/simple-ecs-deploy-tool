@@ -36,6 +36,13 @@ enum Commands {
         #[clap(long)]
         task_definition: Option<String>,
     },
+    /// 最新のイメージタグを使用して新しいタスク定義を作成します
+    UpdateTask {
+        #[clap(long)]
+        task_definition: String,
+        #[clap(long)]
+        repository_name: Option<String>,
+    },
 }
 
 pub async fn run() {
@@ -52,6 +59,13 @@ pub async fn run() {
         Commands::Deploy { cluster, service, task_definition } => {
             let client = AwsSdkClient::new(cli.profile.as_deref()).await;
             if let Err(e) = deploy(&client, cluster, service, task_definition.as_deref(), &mut std::io::stdout()).await {
+                eprintln!("Error: {:?}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::UpdateTask { task_definition, repository_name } => {
+            let client = AwsSdkClient::new(cli.profile.as_deref()).await;
+            if let Err(e) = update_task(&client, task_definition, repository_name.as_deref(), &mut std::io::stdout()).await {
                 eprintln!("Error: {:?}", e);
                 std::process::exit(1);
             }
@@ -207,6 +221,70 @@ pub async fn check<T: AwsClient>(
     Ok(())
 }
 
+pub async fn update_task<T: AwsClient>(
+    client: &T,
+    task_definition: &str,
+    repository_name: Option<&str>,
+    mut writer: impl std::io::Write
+) -> anyhow::Result<()> {
+    let latest_task_definition_arn = client.describe_task_definition(task_definition).await?;
+    
+    writeln!(writer, "Current task definition: {}", latest_task_definition_arn).unwrap();
+    
+    let current_image_uri = match client.get_task_definition_image(&latest_task_definition_arn).await? {
+        Some(uri) => uri,
+        None => {
+            writeln!(writer, "No image found in task definition: {}", latest_task_definition_arn).unwrap();
+            return Err(anyhow::anyhow!("No image found in task definition"));
+        }
+    };
+    
+    let repository_name = match repository_name {
+        Some(name) => name.to_string(),
+        None => match client.get_repository_name_from_image(&current_image_uri).await? {
+            Some(name) => name,
+            None => {
+                writeln!(writer, "Could not get repository name from image URI: {}", current_image_uri).unwrap();
+                return Err(anyhow::anyhow!("Could not get repository name from image URI: {}", current_image_uri));
+            }
+        },
+    };
+    
+    let image_tags = client.describe_image_tags(&repository_name).await?;
+    let latest_image_tag = match image_tags.first() {
+        Some(tag) => tag,
+        None => {
+            writeln!(writer, "No images found in ECR repository: {}", repository_name).unwrap();
+            return Err(anyhow::anyhow!("No images found in ECR repository: {}", repository_name));
+        }
+    };
+    
+    let registry_prefix = if let Some(at_index) = current_image_uri.find('@') {
+        &current_image_uri[..at_index]
+    } else if let Some(colon_index) = current_image_uri.rfind(':') {
+        &current_image_uri[..colon_index]
+    } else {
+        &current_image_uri
+    };
+    
+    let latest_image_uri = format!("{}:{}", registry_prefix, latest_image_tag);
+    
+    writeln!(writer, "Current image: {}", current_image_uri).unwrap();
+    writeln!(writer, "Latest image: {}", latest_image_uri).unwrap();
+    
+    if current_image_uri.contains(&format!(":{}", latest_image_tag)) {
+        writeln!(writer, "Task definition already uses the latest image tag.").unwrap();
+        return Ok(());
+    }
+    
+    writeln!(writer, "Creating new task definition with latest image...").unwrap();
+    let new_task_definition_arn = client.create_task_definition_with_latest_image(&latest_task_definition_arn, &latest_image_uri).await?;
+    
+    writeln!(writer, "New task definition created: {}", new_task_definition_arn).unwrap();
+    
+    Ok(())
+}
+
 #[async_trait]
 pub trait AwsClient: EcrClient + EcsClient {}
 
@@ -225,6 +303,7 @@ pub trait EcsClient {
     async fn get_task_definition_family_from_arn(&self, task_definition_arn: &str) -> anyhow::Result<String>;
     async fn get_image_digest_from_task_definition(&self, task_definition_arn: &str) -> anyhow::Result<Option<String>>;
     async fn update_service(&self, cluster: &str, service: &str, task_definition: &str) -> anyhow::Result<String>;
+    async fn create_task_definition_with_latest_image(&self, task_definition_arn: &str, latest_image_uri: &str) -> anyhow::Result<String>;
 }
 
 pub struct AwsSdkClient {
@@ -383,6 +462,46 @@ impl EcsClient for AwsSdkClient {
         
         Ok(deployment_id)
     }
+
+    async fn create_task_definition_with_latest_image(&self, task_definition_arn: &str, latest_image_uri: &str) -> anyhow::Result<String> {
+        let resp = self.ecs_client.describe_task_definition().task_definition(task_definition_arn).send().await?;
+        
+        let task_def = resp.task_definition.ok_or_else(|| anyhow::anyhow!("Task definition not found"))?;
+        
+        let container_definitions = task_def.container_definitions.unwrap_or_default();
+        if container_definitions.is_empty() {
+            return Err(anyhow::anyhow!("No container definitions found in task definition"));
+        }
+        
+        let mut updated_containers = Vec::new();
+        for container in container_definitions {
+            let mut updated_container = container.clone();
+            updated_container.image = Some(latest_image_uri.to_string());
+            updated_containers.push(updated_container);
+        }
+        
+        let new_task_def = self.ecs_client
+            .register_task_definition()
+            .family(task_def.family.unwrap_or_default())
+            .set_container_definitions(Some(updated_containers))
+            .set_cpu(task_def.cpu)
+            .set_memory(task_def.memory)
+            .set_network_mode(task_def.network_mode)
+            .set_requires_compatibilities(task_def.requires_compatibilities)
+            .set_placement_constraints(task_def.placement_constraints)
+            .set_task_role_arn(task_def.task_role_arn)
+            .set_execution_role_arn(task_def.execution_role_arn)
+            .set_volumes(task_def.volumes)
+            .set_runtime_platform(task_def.runtime_platform)
+            .send()
+            .await?;
+        
+        let new_arn = new_task_def.task_definition
+            .and_then(|td| td.task_definition_arn)
+            .unwrap_or_default();
+        
+        Ok(new_arn)
+    }
 }
 
 impl AwsClient for AwsSdkClient {}
@@ -446,6 +565,10 @@ mod tests {
 
         async fn update_service(&self, _cluster: &str, _service: &str, _task_definition: &str) -> anyhow::Result<String> {
             Ok("deployment-123".to_string())
+        }
+
+        async fn create_task_definition_with_latest_image(&self, _task_definition_arn: &str, _latest_image_uri: &str) -> anyhow::Result<String> {
+            Ok("arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:3".to_string())
         }
     }
 
@@ -520,6 +643,10 @@ mod tests {
             async fn update_service(&self, _cluster: &str, _service: &str, _task_definition: &str) -> anyhow::Result<String> {
                 Ok("deployment-456".to_string())
             }
+
+            async fn create_task_definition_with_latest_image(&self, _task_definition_arn: &str, _latest_image_uri: &str) -> anyhow::Result<String> {
+                Ok("arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:2".to_string())
+            }
         }
         impl AwsClient for MockAwsClientMatch {}
 
@@ -572,6 +699,10 @@ mod tests {
             async fn update_service(&self, _cluster: &str, _service: &str, _task_definition: &str) -> anyhow::Result<String> {
                 Ok("deployment-789".to_string())
             }
+
+            async fn create_task_definition_with_latest_image(&self, _task_definition_arn: &str, _latest_image_uri: &str) -> anyhow::Result<String> {
+                Ok("arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:2".to_string())
+            }
         }
         impl AwsClient for MockAwsClientNoEcrImage {}
 
@@ -622,6 +753,10 @@ mod tests {
 
             async fn update_service(&self, _cluster: &str, _service: &str, _task_definition: &str) -> anyhow::Result<String> {
                 Ok("deployment-abc".to_string())
+            }
+
+            async fn create_task_definition_with_latest_image(&self, _task_definition_arn: &str, _latest_image_uri: &str) -> anyhow::Result<String> {
+                Ok("arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:2".to_string())
             }
         }
         impl AwsClient for MockAwsClientNoServiceImage {}
@@ -689,6 +824,10 @@ mod tests {
             async fn update_service(&self, _cluster: &str, _service: &str, _task_definition: &str) -> anyhow::Result<String> {
                 Ok("deployment-xyz".to_string())
             }
+
+            async fn create_task_definition_with_latest_image(&self, _task_definition_arn: &str, _latest_image_uri: &str) -> anyhow::Result<String> {
+                Ok("arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:2".to_string())
+            }
         }
         impl AwsClient for MockAwsClientNoRepoName {}
 
@@ -720,5 +859,74 @@ mod tests {
         let output = String::from_utf8(writer).unwrap();
         assert!(output.contains("Deploying service 'dummy-service' in cluster 'dummy-cluster'"));
         assert!(output.contains("Deployment started with ID: deployment-123"));
+    }
+
+    #[tokio::test]
+    async fn update_task_subcommand_runs_successfully() {
+        let mock_aws_client = MockAwsClient;
+        let mut writer = Vec::new();
+        let result = update_task(&mock_aws_client, "dummy-task-def", Some("dummy-repo"), &mut writer).await;
+        assert!(result.is_ok());
+        let output = String::from_utf8(writer).unwrap();
+        assert!(output.contains("Current task definition: arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:2"));
+        assert!(output.contains("Current image: 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo@sha256:dummy_digest_from_latest_task_def"));
+        assert!(output.contains("Latest image: 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo:image_tag1"));
+        assert!(output.contains("Creating new task definition with latest image..."));
+        assert!(output.contains("New task definition created: arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:3"));
+    }
+
+    #[tokio::test]
+    async fn update_task_subcommand_already_latest() {
+        struct MockAwsClientAlreadyLatest;
+
+        #[async_trait]
+        impl EcrClient for MockAwsClientAlreadyLatest {
+            async fn describe_image_digests(&self, _repository_name: &str) -> anyhow::Result<Vec<String>> {
+                Ok(vec!["sha256:dummy_digest1".to_string()])
+            }
+            async fn describe_image_tags(&self, _repository_name: &str) -> anyhow::Result<Vec<String>> {
+                Ok(vec!["latest".to_string()])
+            }
+            async fn get_repository_name_from_image(&self, _image_uri: &str) -> anyhow::Result<Option<String>> {
+                Ok(Some("dummy-repo".to_string()))
+            }
+        }
+
+        #[async_trait]
+        impl EcsClient for MockAwsClientAlreadyLatest {
+            async fn describe_task_definition(&self, _task_definition: &str) -> anyhow::Result<String> {
+                Ok("arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:2".to_string())
+            }
+
+            async fn describe_services(&self, _cluster: &str, _service: &str) -> anyhow::Result<String> {
+                Ok("arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:1".to_string())
+            }
+
+            async fn get_task_definition_image(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
+                Ok(Some("123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/dummy-repo:latest".to_string()))
+            }
+            async fn get_task_definition_family_from_arn(&self, _task_definition_arn: &str) -> anyhow::Result<String> {
+                Ok("dummy-task-def".to_string())
+            }
+            async fn get_image_digest_from_task_definition(&self, _task_definition_arn: &str) -> anyhow::Result<Option<String>> {
+                Ok(Some("sha256:dummy_digest1".to_string()))
+            }
+
+            async fn update_service(&self, _cluster: &str, _service: &str, _task_definition: &str) -> anyhow::Result<String> {
+                Ok("deployment-456".to_string())
+            }
+
+            async fn create_task_definition_with_latest_image(&self, _task_definition_arn: &str, _latest_image_uri: &str) -> anyhow::Result<String> {
+                Ok("arn:aws:ecs:ap-northeast-1:123456789012:task-definition/dummy-task-def:3".to_string())
+            }
+        }
+        impl AwsClient for MockAwsClientAlreadyLatest {}
+
+        let mock_aws_client = MockAwsClientAlreadyLatest;
+        let mut writer = Vec::new();
+        let result = update_task(&mock_aws_client, "dummy-task-def", Some("dummy-repo"), &mut writer).await;
+        assert!(result.is_ok());
+        let output = String::from_utf8(writer).unwrap();
+        assert!(output.contains("Task definition already uses the latest image tag."));
     }
 }
